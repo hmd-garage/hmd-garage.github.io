@@ -2497,6 +2497,101 @@ function ExpensesView({ db, addExpense, updExpense, delExpense, setConfirm, setN
       "«شهري ثابت» يتكرر كل شهر من تاريخ البداية · «سنوي» و«مرة واحدة» ينحسبون بالشهر اللي فيه تاريخهم · الإيقاف المؤقت يوقف احتسابه بدون ما يمسحه."));
 }
 
+/* ===================== مزامنة متعددة الأجهزة: دمج ذكي + سحب تلقائي ===================== */
+const SYNC_COLL = ["cars", "services", "inspections", "invoices", "bookings", "expenses"];
+const nowISO = () => (/* @__PURE__ */ new Date()).toISOString();
+const recTime = (r) => r && (r.updatedAt || r.createdAt || r.date || "") || "";
+
+/* يضيف بصمة وقت لكل سجل تغيّر، ويسجّل «شواهد حذف» للسجلات المحذوفة */
+function stampChanges(prev, next) {
+  const now = nowISO();
+  const out = { ...next };
+  const deleted = { ...(prev.deleted || {}), ...(next.deleted || {}) };
+  let touched = false;
+  SYNC_COLL.forEach((k) => {
+    const pl = Array.isArray(prev[k]) ? prev[k] : [];
+    const nl = next[k];
+    if (!Array.isArray(nl) || nl === pl) return;
+    const pmap = {};
+    pl.forEach((r) => { if (r && r.id != null) pmap[r.id] = r; });
+    out[k] = nl.map((r) => {
+      if (!r || r.id == null) return r;
+      const p = pmap[r.id];
+      if (p === r) return r;
+      touched = true;
+      return { ...r, updatedAt: now };
+    });
+    const nids = {};
+    out[k].forEach((r) => { if (r && r.id != null) nids[r.id] = 1; });
+    pl.forEach((r) => {
+      if (r && r.id != null && !nids[r.id]) { deleted[k + ":" + r.id] = now; touched = true; }
+    });
+  });
+  out.deleted = deleted;
+  if (touched || out.garageName !== prev.garageName || out.rolePins !== prev.rolePins) out.metaAt = now;
+  return out;
+}
+
+/* دمج نسختين: كل سجل يأخذ الأحدث، والمحذوف يضل محذوف */
+function mergeDbs(local, remote) {
+  if (!remote || !Array.isArray(remote.cars)) return local;
+  const out = { ...local };
+  const deleted = { ...(local.deleted || {}) };
+  Object.keys(remote.deleted || {}).forEach((k) => {
+    if (!deleted[k] || remote.deleted[k] > deleted[k]) deleted[k] = remote.deleted[k];
+  });
+  SYNC_COLL.forEach((k) => {
+    const map = {};
+    (Array.isArray(local[k]) ? local[k] : []).forEach((r) => { if (r && r.id != null) map[r.id] = r; });
+    (Array.isArray(remote[k]) ? remote[k] : []).forEach((r) => {
+      if (!r || r.id == null) return;
+      const cur = map[r.id];
+      if (!cur) map[r.id] = r;
+      else map[r.id] = recTime(r) > recTime(cur) ? r : cur;
+    });
+    out[k] = Object.keys(map).map((id) => map[id]).filter((r) => {
+      const t = deleted[k + ":" + r.id];
+      return !(t && t > recTime(r));
+    });
+  });
+  out.deleted = deleted;
+  out.invoiceCounter = Math.max(Number(local.invoiceCounter) || 0, Number(remote.invoiceCounter) || 0);
+  const la = local.metaAt || "", ra = remote.metaAt || "";
+  if (ra > la) {
+    out.garageName = remote.garageName || local.garageName;
+    out.rolePins = remote.rolePins || local.rolePins;
+    out.metaAt = ra;
+  } else {
+    out.garageName = local.garageName || remote.garageName;
+    out.rolePins = local.rolePins || remote.rolePins;
+    out.metaAt = la;
+  }
+  return out;
+}
+
+/* مقارنة سريعة بدون الصور (عشان ما نرفع بدون داعي) */
+const dbFingerprint = (d) => {
+  if (!d) return "";
+  const slim = {};
+  SYNC_COLL.forEach((k) => {
+    slim[k] = (d[k] || []).map((r) => [r.id, recTime(r)]).sort((a, b) => String(a[0]) > String(b[0]) ? 1 : -1);
+  });
+  slim.g = d.garageName;
+  slim.c = d.invoiceCounter;
+  slim.p = d.rolePins ? Object.keys(d.rolePins).map((k) => k + ":" + String(d.rolePins[k]).length).join(",") : "";
+  slim.d = Object.keys(d.deleted || {}).sort().join(",");
+  try { return JSON.stringify(slim); } catch (e) { return String(Math.random()); }
+};
+
+const syncAgoTxt = (ts, now) => {
+  if (!ts) return "";
+  const s = Math.max(0, Math.round((now - ts) / 1e3));
+  if (s < 45) return "الآن";
+  const m = Math.round(s / 60);
+  if (m < 60) return "قبل " + m + " د";
+  return "قبل " + Math.round(m / 60) + " س";
+};
+
 function App() {
   const [db, setDb] = useState(null);
   const [, __setLangTick] = useState(0);
@@ -2528,6 +2623,8 @@ function App() {
   const fileRef = useRef(null);
   const pushTimer = useRef(null);
   const skipNextPush = useRef(false);
+  const dbRef = useRef(null);
+  const pulling = useRef(false);
   useEffect(() => {
     const local = store.load();
     if (local && local.garageName === "\u0643\u0631\u0627\u062C \u0627\u0644\u0634\u0648\u064A\u062E") local.garageName = "HMD";
@@ -2551,8 +2648,9 @@ function App() {
         try {
           const remote = await DBX.downloadDb();
           if (remote && Array.isArray(remote.cars)) {
-            skipNextPush.current = true;
-            setDb({ ...base, ...remote });
+            const merged = mergeDbs(base, remote);
+            skipNextPush.current = dbFingerprint(merged) === dbFingerprint(remote);
+            setDb(merged);
             setDbxState((x) => ({ ...x, connected: true, lastSync: Date.now() }));
             return;
           }
@@ -2595,6 +2693,41 @@ function App() {
     const t = setInterval(() => setNowTs(Date.now()), 3e4);
     return () => clearInterval(t);
   }, []);
+  useEffect(() => { dbRef.current = db; }, [db]);
+  useEffect(() => {
+    let stopped = false;
+    const pull = async () => {
+      if (stopped || pulling.current || !DBX.connected()) return;
+      const local = dbRef.current;
+      if (!local) return;
+      pulling.current = true;
+      try {
+        const remote = await DBX.downloadDb();
+        if (remote && Array.isArray(remote.cars)) {
+          const merged = mergeDbs(local, remote);
+          const fLocal = dbFingerprint(local), fMerged = dbFingerprint(merged), fRemote = dbFingerprint(remote);
+          if (fMerged !== fLocal) {
+            skipNextPush.current = fMerged === fRemote;
+            setDb(merged);
+            setNotice({ ok: true, text: "\u0648\u0635\u0644\u062A \u062A\u062D\u062F\u064A\u062B\u0627\u062A \u062C\u062F\u064A\u062F\u0629 \u0645\u0646 \u062C\u0647\u0627\u0632 \u062B\u0627\u0646\u064A" });
+          }
+          if (fMerged !== fRemote) {
+            try { await DBX.uploadDb(merged); } catch (e) {}
+          }
+          setDbxState((x) => ({ ...x, connected: true, lastSync: Date.now(), offline: false }));
+        }
+      } catch (e) {
+        setDbxState((x) => ({ ...x, offline: true }));
+      }
+      pulling.current = false;
+    };
+    const t = setInterval(pull, 15e3);
+    const onWake = () => { if (!document.hidden) pull(); };
+    window.addEventListener("focus", onWake);
+    document.addEventListener("visibilitychange", onWake);
+    const first = setTimeout(pull, 4e3);
+    return () => { stopped = true; clearInterval(t); clearTimeout(first); clearTimeout(first); window.removeEventListener("focus", onWake); document.removeEventListener("visibilitychange", onWake); };
+  }, []);
   useEffect(() => {
     if (!db) return;
     const due = (db.bookings || []).filter((b) => bkDue(b, nowTs));
@@ -2623,7 +2756,7 @@ function App() {
   const dueBookings = bookings.filter((b) => bkDue(b, nowTs));
   const soonBookings = bookings.filter((b) => bkSoon(b, nowTs));
   const notifCount = dueBookings.length + soonBookings.length;
-  const up = (patch) => setDb((prev) => ({ ...prev, ...typeof patch === "function" ? patch(prev) : patch }));
+  const up = (patch) => setDb((prev) => stampChanges(prev, { ...prev, ...typeof patch === "function" ? patch(prev) : patch }));
   const addCar = (data) => {
     const plate = plateNorm(data.plate);
     up((p) => ({ cars: [...p.cars, { id: plate, ...data, plate, createdAt: (/* @__PURE__ */ new Date()).toISOString() }] }));
@@ -2749,7 +2882,10 @@ function App() {
   ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 7);
   async function resetAll() {
     clearTimeout(pushTimer.current);
-    const fresh = { cars: [], services: [], inspections: [], invoices: [], bookings: [], expenses: [], invoiceCounter: 0, garageName, rolePins };
+    const tomb = {};
+    const nowT = (/* @__PURE__ */ new Date()).toISOString();
+    SYNC_COLL.forEach((k) => (db[k] || []).forEach((r) => { if (r && r.id != null) tomb[k + ":" + r.id] = nowT; }));
+    const fresh = { cars: [], services: [], inspections: [], invoices: [], bookings: [], expenses: [], invoiceCounter: 0, garageName, rolePins, deleted: { ...(db.deleted || {}), ...tomb }, metaAt: nowT };
     if (DBX.connected()) {
       DBX.forgetFileCache();
       try {
@@ -2862,7 +2998,7 @@ function App() {
     }, title: "\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062A", style: { position: "relative", padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: notifCount ? "#F0B67F" : "rgba(255,255,255,.5)", flexShrink: 0 } }, I.bell, notifCount > 0 && /* @__PURE__ */ React.createElement("span", { style: { position: "absolute", top: 2, insetInlineEnd: 2, minWidth: 16, height: 16, padding: "0 3px", borderRadius: 8, fontSize: 12.5, fontWeight: 900, background: dueBookings.length ? "var(--red)" : "var(--amber)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" } }, notifCount)), role === "manager" && navBtn(view === "dashboard", () => setView("dashboard"), I.dash, "\u0644\u0648\u062D\u0629 \u0627\u0644\u062A\u062D\u0643\u0645", 0), navBtn(view === "cars" || view === "carDetail", () => {
       setView("cars");
       setSelPlate(null);
-    }, I.car, role === "reception" ? "\u0628\u062D\u062B \u0627\u0644\u0633\u064A\u0627\u0631\u0627\u062A" : "\u0627\u0644\u0633\u064A\u0627\u0631\u0627\u062A", 0), (role === "manager" || role === "reception") && navBtn(view === "desk", () => setView("desk"), I.truck, "\u062E\u062F\u0645\u0627\u062A \u0627\u0644\u0627\u0633\u062A\u0642\u0628\u0627\u0644", dueBookings.length), (role === "manager" || role === "reception") && navBtn(view === "reception", () => setView("reception"), I.inbox, "\u062A\u0642\u0627\u0631\u064A\u0631 \u0627\u0644\u0641\u062D\u0635", pendingReports), (role === "manager" || role === "reception") && navBtn(view === "invoices", () => setView("invoices"), I.receipt, "\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631", 0), (role === "manager" || role === "reception") && navBtn(view === "garage", () => setView("garage"), I.tag, "\u0633\u064A\u0627\u0631\u0627\u062A \u0627\u0644\u0643\u0631\u0627\u062C", 0), role === "manager" && navBtn(showDbx, () => setShowDbx(true), I.cloud, dbxState.connected ? "Dropbox \u2713" : "\u0631\u0628\u0637 Dropbox", 0), role === "manager" && navBtn(view === "expenses", () => setView("expenses"), I.money, "\u0627\u0644\u0645\u0635\u0627\u0631\u064a\u0641", 0), role === "manager" && navBtn(view === "reports", () => setView("reports"), I.chart, "\u0627\u0644\u0645\u064A\u0632\u0627\u0646\u064A\u0629 \u0648\u0627\u0644\u062A\u0642\u0627\u0631\u064A\u0631", 0), (role === "manager" || role === "reception") && navBtn(view === "calc", () => setView("calc"), I.percent, "\u0627\u0644\u062D\u0627\u0633\u0628\u0629", 0), role === "manager" && navBtn(view === "pricing", () => setView("pricing"), I.calc, "\u0645\u062D\u0644\u0644 \u0627\u0644\u062A\u0633\u0639\u064A\u0631", 0), /* @__PURE__ */ React.createElement("button", { onClick: exportBackup, title: "\u0646\u0633\u062E\u0629 \u0627\u062D\u062A\u064A\u0627\u0637\u064A\u0629", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.download), /* @__PURE__ */ React.createElement("button", { onClick: () => fileRef.current && fileRef.current.click(), title: "\u0627\u0633\u062A\u064A\u0631\u0627\u062F", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.upload), role === "manager" && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowPins(true), title: "\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0633\u0631", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.lock), role === "manager" && /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirm({ message: "\u0628\u064A\u0646\u0645\u0633\u062D \u0643\u0644 \u0627\u0644\u0633\u064A\u0627\u0631\u0627\u062A \u0648\u0627\u0644\u0635\u064A\u0627\u0646\u0629 \u0648\u0627\u0644\u0641\u062D\u0648\u0635\u0627\u062A \u0648\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631 \u0648\u0645\u0644\u0641\u0627\u062A \u0627\u0644\u0639\u0645\u0644\u0627\u0621 \u0645\u0646 Dropbox \u2014 \u064A\u0639\u0646\u064A \u0627\u0644\u0645\u0648\u0642\u0639 \u064A\u0631\u062C\u0639 \u0641\u0627\u0636\u064A \u0645\u062B\u0644 \u0623\u0648\u0644 \u0645\u0631\u0629. \u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0633\u0631 \u0648\u0627\u0633\u0645 \u0627\u0644\u0643\u0631\u0627\u062C \u0628\u064A\u0638\u0644\u0648\u0646. \u0645\u0627 \u064A\u0646\u0631\u062C\u0639 \u0628\u0639\u062F \u0627\u0644\u062A\u0623\u0643\u064A\u062F \u2014 \u0645\u062A\u0623\u0643\u062F\u061F", onConfirm: resetAll }), title: "\u0645\u0633\u062D \u0643\u0644 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A (\u0628\u062F\u0621 \u0645\u0646 \u062C\u062F\u064A\u062F)", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.trash), role === "manager" && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowDbx(true), title: "\u0645\u0632\u0627\u0645\u0646\u0629 Dropbox", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: dbxState.connected ? "#7FD1A8" : "rgba(255,255,255,.5)", flexShrink: 0 } }, I.cloud), /* @__PURE__ */ React.createElement("input", { ref: fileRef, type: "file", accept: "application/json", style: { display: "none" }, onChange: (e) => {
+    }, I.car, role === "reception" ? "\u0628\u062D\u062B \u0627\u0644\u0633\u064A\u0627\u0631\u0627\u062A" : "\u0627\u0644\u0633\u064A\u0627\u0631\u0627\u062A", 0), (role === "manager" || role === "reception") && navBtn(view === "desk", () => setView("desk"), I.truck, "\u062E\u062F\u0645\u0627\u062A \u0627\u0644\u0627\u0633\u062A\u0642\u0628\u0627\u0644", dueBookings.length), (role === "manager" || role === "reception") && navBtn(view === "reception", () => setView("reception"), I.inbox, "\u062A\u0642\u0627\u0631\u064A\u0631 \u0627\u0644\u0641\u062D\u0635", pendingReports), (role === "manager" || role === "reception") && navBtn(view === "invoices", () => setView("invoices"), I.receipt, "\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631", 0), (role === "manager" || role === "reception") && navBtn(view === "garage", () => setView("garage"), I.tag, "\u0633\u064A\u0627\u0631\u0627\u062A \u0627\u0644\u0643\u0631\u0627\u062C", 0), role === "manager" && navBtn(showDbx, () => setShowDbx(true), I.cloud, dbxState.connected ? (dbxState.offline ? "Dropbox \u26A0" : "Dropbox \u00B7 " + syncAgoTxt(dbxState.lastSync, nowTs)) : "\u0631\u0628\u0637 Dropbox", 0), role === "manager" && navBtn(view === "expenses", () => setView("expenses"), I.money, "\u0627\u0644\u0645\u0635\u0627\u0631\u064a\u0641", 0), role === "manager" && navBtn(view === "reports", () => setView("reports"), I.chart, "\u0627\u0644\u0645\u064A\u0632\u0627\u0646\u064A\u0629 \u0648\u0627\u0644\u062A\u0642\u0627\u0631\u064A\u0631", 0), (role === "manager" || role === "reception") && navBtn(view === "calc", () => setView("calc"), I.percent, "\u0627\u0644\u062D\u0627\u0633\u0628\u0629", 0), role === "manager" && navBtn(view === "pricing", () => setView("pricing"), I.calc, "\u0645\u062D\u0644\u0644 \u0627\u0644\u062A\u0633\u0639\u064A\u0631", 0), /* @__PURE__ */ React.createElement("button", { onClick: exportBackup, title: "\u0646\u0633\u062E\u0629 \u0627\u062D\u062A\u064A\u0627\u0637\u064A\u0629", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.download), /* @__PURE__ */ React.createElement("button", { onClick: () => fileRef.current && fileRef.current.click(), title: "\u0627\u0633\u062A\u064A\u0631\u0627\u062F", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.upload), role === "manager" && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowPins(true), title: "\u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0633\u0631", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.lock), role === "manager" && /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirm({ message: "\u0628\u064A\u0646\u0645\u0633\u062D \u0643\u0644 \u0627\u0644\u0633\u064A\u0627\u0631\u0627\u062A \u0648\u0627\u0644\u0635\u064A\u0627\u0646\u0629 \u0648\u0627\u0644\u0641\u062D\u0648\u0635\u0627\u062A \u0648\u0627\u0644\u0641\u0648\u0627\u062A\u064A\u0631 \u0648\u0645\u0644\u0641\u0627\u062A \u0627\u0644\u0639\u0645\u0644\u0627\u0621 \u0645\u0646 Dropbox \u2014 \u064A\u0639\u0646\u064A \u0627\u0644\u0645\u0648\u0642\u0639 \u064A\u0631\u062C\u0639 \u0641\u0627\u0636\u064A \u0645\u062B\u0644 \u0623\u0648\u0644 \u0645\u0631\u0629. \u0643\u0644\u0645\u0627\u062A \u0627\u0644\u0633\u0631 \u0648\u0627\u0633\u0645 \u0627\u0644\u0643\u0631\u0627\u062C \u0628\u064A\u0638\u0644\u0648\u0646. \u0645\u0627 \u064A\u0646\u0631\u062C\u0639 \u0628\u0639\u062F \u0627\u0644\u062A\u0623\u0643\u064A\u062F \u2014 \u0645\u062A\u0623\u0643\u062F\u061F", onConfirm: resetAll }), title: "\u0645\u0633\u062D \u0643\u0644 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A (\u0628\u062F\u0621 \u0645\u0646 \u062C\u062F\u064A\u062F)", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "rgba(255,255,255,.5)", flexShrink: 0 } }, I.trash), role === "manager" && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowDbx(true), title: "\u0645\u0632\u0627\u0645\u0646\u0629 Dropbox", style: { padding: 8, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: dbxState.connected ? "#7FD1A8" : "rgba(255,255,255,.5)", flexShrink: 0 } }, I.cloud), /* @__PURE__ */ React.createElement("input", { ref: fileRef, type: "file", accept: "application/json", style: { display: "none" }, onChange: (e) => {
       const f = e.target.files && e.target.files[0];
       if (f) importFile(f);
       e.target.value = "";
@@ -3294,7 +3430,7 @@ function DropboxModal({ state, setState, db, setDb, skipNextPush, setNotice, onC
       const remote = await DBX.downloadDb();
       if (remote && Array.isArray(remote.cars)) {
         skipNextPush.current = true;
-        setDb((prev) => ({ ...prev, ...remote }));
+        setDb((prev) => mergeDbs(prev, remote));
         setState((x) => ({ ...x, lastSync: Date.now() }));
         setNotice({ ok: true, text: "\u0627\u0646\u0633\u062D\u0628\u062A \u0622\u062E\u0631 \u0646\u0633\u062E\u0629 \u0645\u0646 Dropbox" });
       } else setNotice({ ok: false, text: "\u0645\u0627 \u0641\u064A\u0647 \u0646\u0633\u062E\u0629 \u0645\u062D\u0641\u0648\u0638\u0629 \u0628\u0639\u062F" });
